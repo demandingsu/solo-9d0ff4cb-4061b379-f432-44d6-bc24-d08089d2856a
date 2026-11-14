@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import inspect
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -426,3 +429,193 @@ def test_download_blocks_text_withdrawn_before_export(portal):
             break
         time.sleep(0.05)
     assert row["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# revoke/upload interleaving (the concurrency defect under repair)
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _revoke_transaction_barrier(portal_instance):
+    """Gate the single write transaction of ``revoke`` behind two events.
+
+    ``entered`` fires when the revoker reaches its write transaction; the
+    revoker then blocks on ``release``. A racing upload issued in between parks
+    on SQLite's single-writer lock, reproducing the exact interleaving
+    deterministically rather than by timing luck.
+    """
+    from training_portal.db import Database
+
+    original = Database.transaction
+    entered = threading.Event()
+    release = threading.Event()
+
+    @contextlib.contextmanager
+    def gated(self):
+        in_revoke = any(frame.function == "revoke" for frame in inspect.stack())
+        if in_revoke and not getattr(threading.current_thread(), "_gate_used", False):
+            threading.current_thread()._gate_used = True
+            entered.set()
+            assert release.wait(10), "revoker was never released"
+        with original(self) as conn:
+            yield conn
+
+    Database.transaction = gated
+    try:
+        yield entered, release
+    finally:
+        Database.transaction = original
+
+
+def test_same_id_upload_racing_revocation_never_leaks_its_text(portal):
+    """The reported defect, forced into one deterministic ordering.
+
+    A same-id CSV uploaded while the revocation's write transaction is open
+    must (a) store nothing, (b) register every text it carried as withdrawn, so
+    that neither a later same-id upload nor the same text under a new id can
+    ever reach a training file.
+    """
+    from training_portal.service import text_hash
+
+    upload(
+        portal,
+        "batch,respondent_id,text\n"
+        "B1,R1,受访者 R1 的机密文本 alpha\n"
+        "B1,R2,无关受访者 R2 的文本 beta\n",
+    )
+    job_id = portal.create_job("B1")
+    wait_for(portal, job_id)
+    affected_export = portal.exports()[0]["id"]
+
+    racing_text = "撤回处理中才上传的同号新文本 delta"
+    racing_csv = (
+        "batch,respondent_id,text\n"
+        "B1,R1,受访者 R1 的机密文本 alpha\n"
+        f"B1,R1,{racing_text}\n"
+    )
+
+    with _revoke_transaction_barrier(portal) as (entered, release):
+        result_box = {}
+
+        def racing_upload():
+            assert entered.wait(10)
+            # Let this thread issue its BEGIN IMMEDIATE and block on the lock.
+            time.sleep(0.3)
+            result_box["result"] = portal.ingest_upload("race.csv", racing_csv.encode())
+
+        uploader = threading.Thread(target=racing_upload)
+        revoker = threading.Thread(target=portal.revoke, args=("R1",))
+        uploader.start()
+        revoker.start()
+        time.sleep(0.2)
+        release.set()
+        revoker.join(10)
+        uploader.join(10)
+        assert not revoker.is_alive() and not uploader.is_alive()
+
+    assert result_box["result"]["accepted"] == 0
+    assert result_box["result"]["skipped_revoked"] == 2
+
+    # Nothing from the racing upload survived into the corpus.
+    assert portal.stats()["utterances"] == 1
+    with portal.db.read() as conn:
+        recorded = {
+            row["text_hash"]
+            for row in conn.execute("SELECT text_hash FROM revoked_text_hashes")
+        }
+    assert text_hash(racing_text) in recorded
+    assert text_hash("受访者 R1 的机密文本 alpha") in recorded
+
+    # The export published before the revoke is immediately non-downloadable.
+    handle, _name, error = portal.open_download(affected_export)
+    assert handle is None and error
+
+    # Same-id re-upload and same-text-under-new-id are both refused afterwards.
+    later = upload(portal, f"batch,respondent_id,text\nB1,R1,{racing_text}\n")
+    assert later["accepted"] == 0 and later["skipped_revoked"] == 1
+    swapped = upload(portal, f"batch,respondent_id,text\nB1,R9,{racing_text}\n")
+    assert swapped["accepted"] == 0 and swapped["skipped_revoked"] == 1
+
+    # Therefore a freshly generated batch cannot contain any withdrawn text.
+    upload(portal, "batch,respondent_id,text\nB9,R8,干净的全新语料 eta\n")
+    new_job = portal.create_job("B9")
+    settled = wait_for(portal, new_job)
+    assert settled["status"] == "completed"
+    clean_export = next(e for e in portal.exports() if e["batch"] == "B9")
+    handle, _name, error = portal.open_download(clean_export["id"])
+    assert error is None and handle is not None
+    body = handle.read().decode("utf-8")
+    handle.close()
+    assert racing_text not in body and "alpha" not in body and "eta" in body
+
+
+def test_revoked_id_upload_registers_its_text_hashes(portal):
+    """Rows filtered out for matching a revoked id still withdraw their text.
+
+    Without this, text carried only by post-revocation same-id uploads could
+    re-enter under a different respondent id.
+    """
+    from training_portal.service import text_hash
+
+    upload(portal, "batch,respondent_id,text\nB1,R1,原始文本 alpha\n")
+    portal.revoke("R1")
+    secret = "撤回后才出现的同号文本 theta"
+
+    result = upload(portal, f"batch,respondent_id,text\nB1,R1,{secret}\n")
+    assert result["accepted"] == 0 and result["skipped_revoked"] == 1
+    with portal.db.read() as conn:
+        recorded = {
+            row["text_hash"]
+            for row in conn.execute("SELECT text_hash FROM revoked_text_hashes")
+        }
+    assert text_hash(secret) in recorded
+
+    swapped = upload(portal, f"batch,respondent_id,text\nB1,R7,{secret}\n")
+    assert swapped["accepted"] == 0 and swapped["skipped_revoked"] == 1
+
+
+def test_revocation_while_job_paused_blocks_it_under_racing_upload(portal):
+    """An in-flight generation at the pause gate plus a racing same-id upload:
+    the job is blocked, nothing is published, and the upload stores nothing."""
+    upload(
+        portal,
+        "batch,respondent_id,text\n"
+        "B1,R1,机密文本 alpha\nB1,R2,无关文本 beta\n",
+    )
+    portal.db.set_settings({"pause_generation": "1"})
+    job_id = portal.create_job("B1")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = next(j for j in portal.jobs() if j["id"] == job_id)
+        if job["status"] == "paused":
+            break
+        time.sleep(0.05)
+    assert job["status"] == "paused"
+    exports_before = len(portal.exports())
+
+    racing_csv = "batch,respondent_id,text\nB1,R1,在途期间同号新文本 delta\n"
+    with _revoke_transaction_barrier(portal) as (entered, release):
+        result_box = {}
+
+        def racing_upload():
+            assert entered.wait(10)
+            time.sleep(0.3)
+            result_box["result"] = portal.ingest_upload("race.csv", racing_csv.encode())
+
+        uploader = threading.Thread(target=racing_upload)
+        revoker = threading.Thread(target=portal.revoke, args=("R1",))
+        uploader.start()
+        revoker.start()
+        time.sleep(0.2)
+        release.set()
+        revoker.join(10)
+        uploader.join(10)
+
+    portal.db.set_settings({"pause_generation": "0"})
+    settled = wait_for(portal, job_id)
+    assert settled["status"] == "blocked"
+    assert result_box["result"]["accepted"] == 0
+    assert len(portal.exports()) == exports_before
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and list(portal.tmp_dir.glob("*.csv")):
+        time.sleep(0.05)
+    assert not list(portal.tmp_dir.glob("*.csv"))

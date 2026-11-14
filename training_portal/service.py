@@ -232,6 +232,7 @@ class Portal:
             raise ValidationError("CSV 中没有数据行")
 
         now = utc_now()
+        newly_revoked_hashes: list[tuple[str, str, str]] = []
         with self.db.transaction() as conn:
             revoked_ids = {
                 row["respondent_id"]
@@ -244,13 +245,29 @@ class Portal:
             accepted: list[ParsedRow] = []
             skipped_revoked = 0
             for row in rows:
+                row_hash = text_hash(row.text)
                 # Withdrawn consent is permanent. The same id can never re-enter,
                 # and neither can an utterance that was already withdrawn if it
                 # is re-uploaded under another id.
-                if row.respondent_id in revoked_ids or text_hash(row.text) in revoked_hashes:
+                if row.respondent_id in revoked_ids:
+                    skipped_revoked += 1
+                    # A same-id upload racing a revocation is filtered here, so
+                    # its rows are never stored - but the text itself is still
+                    # registered as withdrawn, otherwise the very same text
+                    # could re-enter a moment later under a different id.
+                    newly_revoked_hashes.append((row_hash, row.respondent_id, now))
+                    continue
+                if row_hash in revoked_hashes:
                     skipped_revoked += 1
                     continue
                 accepted.append(row)
+
+            if newly_revoked_hashes:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO revoked_text_hashes"
+                    "(text_hash, respondent_id, created_at) VALUES (?, ?, ?)",
+                    newly_revoked_hashes,
+                )
 
             batches = sorted({row.batch for row in accepted})
             for batch in batches:
@@ -294,14 +311,20 @@ class Portal:
     # revocation
     # ------------------------------------------------------------------
     def revoke(self, respondent_id: str) -> dict[str, Any]:
-        """Persist the revocation first, then delete rows and lock exports.
+        """Persist the revocation and apply every consequence atomically.
 
-        The revocation insert, corpus deletion, export lockdown and job blocking
-        are a single ``BEGIN IMMEDIATE`` transaction. A download or publication
-        that committed before it may proceed (it was authorized at that instant);
-        one that starts after it sees the revocation. Files are unlinked after
-        commit; failures leave ``pending_delete`` rows that the cleanup worker
-        retries, and those rows are never downloadable meanwhile.
+        Snapshotting the respondent's texts, inserting the revocation,
+        registering the withdrawn hashes, deleting corpus rows, locking exports
+        and blocking jobs all happen in ONE ``BEGIN IMMEDIATE`` transaction.
+        Ingestion takes the same single-writer lock, so an upload can only ever
+        commit strictly before or strictly after the revocation: there is no
+        window in which a same-id upload is deleted by the revocation while its
+        texts escape hash registration. Rows an upload filters out against an
+        existing revocation get their hashes registered by the upload itself.
+
+        Files are unlinked after commit; failures leave ``pending_delete`` rows
+        that the cleanup worker retries, and those rows are never downloadable
+        meanwhile.
         """
         respondent_id = respondent_id.strip()
         if not respondent_id:
@@ -313,6 +336,9 @@ class Portal:
                 "SELECT 1 FROM revocations WHERE respondent_id = ?", (respondent_id,)
             ).fetchone()
 
+            # Snapshot inside this same write transaction: any upload that could
+            # add same-id rows is blocked on the writer lock until we commit, so
+            # no committed text can fall between the snapshot and the delete.
             rows = conn.execute(
                 "SELECT DISTINCT batch, text FROM utterances WHERE respondent_id = ?",
                 (respondent_id,),
@@ -320,13 +346,12 @@ class Portal:
             batches = sorted({row["batch"] for row in rows})
             hashes = sorted({text_hash(row["text"]) for row in rows})
 
-        with self.db.transaction() as conn:
             if not already:
                 conn.execute(
                     "INSERT INTO revocations(respondent_id, revoked_at) VALUES (?, ?)",
                     (respondent_id, now),
                 )
-            # Remember every hash already stored for this respondent, so a hashed
+            # Remember every hash ever stored for this respondent, so a hashed
             # copy of their text can never be exported again - even under a new
             # respondent id, and even if that copy was never uploaded.
             conn.executemany(
